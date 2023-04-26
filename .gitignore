@@ -1,1 +1,4 @@
 *.idea
+checkpoints
+*.pyc
+__pycache__

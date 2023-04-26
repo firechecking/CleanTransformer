@@ -17,12 +17,21 @@ def wordpunct_tokenize(text):
 
 
 class BPETokenizer():
-    special = ['<UNK>', '<PAD>', '<END>', '<MASK>']
-
-    def __init__(self, vocab_size=1000, lowercase=True, basic_tokenizer=wordpunct_tokenize):
+    def __init__(self, vocab_size=1000, lowercase=True, basic_tokenizer=wordpunct_tokenize,
+                 unk='<UNK>', sep='<SEP>', pad='<PAD>', cls='<CLS>', mask='<MASK>'):
         self.lowercase = lowercase
         self.vocab_size = vocab_size
         self.basic_tokenizer = basic_tokenizer
+        self.unk, self.sep, self.pad, self.cls, self.mask = unk, sep, pad, cls, mask
+
+    def load(self, vocab_fn=None, vocab=None):
+        if vocab:
+            self.vocab = vocab
+        else:
+            self.vocab = [l.strip() for l in open(vocab_fn, 'r').readlines()]
+        self.vocab_size = len(self.vocab)
+        self.id2token = {i: v for i, v in enumerate(self.vocab)}
+        self.token2id = {v: i for i, v in self.id2token.items()}
 
     def fit(self, corpus: list, max_steps=10000, out_fn='vocab.txt'):
         '''
@@ -82,7 +91,7 @@ class BPETokenizer():
                 word_corpus.pop(token)
         return word_corpus, bi_cnt
 
-    def tokenize(self, text: str, add_post='</w>'):
+    def tokenize(self, text: str, add_pre=None, add_mid=None, add_post='</w>'):
         '''
         将text转换成tokens
         '''
@@ -94,19 +103,23 @@ class BPETokenizer():
         ############### 简单分词，并遍历token ###############
         for token in self.basic_tokenizer(text):
             token = list(token)
-            if add_post:
-                token = token + [add_post]
+            token = [add_pre] + token if add_pre else token
+            token = token + [add_post] if add_post else token
             start, end = 0, len(token)
 
             ############### 查找最长sub_token ###############
             while start < end:
                 sub_token = ''.join(token[start:end])
+
+                if start > 0 and add_mid:
+                    sub_token = add_mid + sub_token
+
                 if sub_token in self.vocab:
                     new_token.append(sub_token)
                     start = end
                     end = len(token)
                 elif end - start == 1:
-                    new_token.append('<UNK>')
+                    new_token.append(self.unk)
                     start = end
                     end = len(token)
                 else:
@@ -117,7 +130,7 @@ class BPETokenizer():
     def _token2id(self, token):
         if token in self.vocab:
             return self.vocab.index(token)
-        return self.vocab.index('<UNK>')
+        return self.vocab.index(self.unk)
 
     def _id2token(self, id):
         return self.vocab[id]
