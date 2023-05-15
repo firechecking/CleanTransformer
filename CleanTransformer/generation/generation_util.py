@@ -7,6 +7,7 @@
 # @Description: generation_util
 
 import torch
+from CleanTransformer.generation.logits_processor import NoRepeatNGramLogitsProcessor
 
 
 class GenerationMixin():
@@ -28,9 +29,14 @@ class GenerationMixin():
         max_gen_len = generation_configs.get('max_gen_len', 100)
         end_ids = generation_configs.get('end_ids', None)
         pad_id = generation_configs.get('pad_id', 0)
+        no_repeat_ngram_size = generation_configs.get('no_repeat_ngram_size', 0)
 
         if isinstance(end_ids, int): end_ids = [end_ids]
         end_ids_tensor = torch.tensor(list(end_ids)).to(input_ids.device) if end_ids is not None else None
+
+        self.logits_processors = []
+        if no_repeat_ngram_size > 1:
+            self.logits_processors.append(NoRepeatNGramLogitsProcessor(no_repeat_ngram_size))
 
         if beam_size == 1:
             return self._greedy_search(input_ids, attention_mask, position_ids, segment_ids,
@@ -74,6 +80,11 @@ class GenerationMixin():
                                                  None if segment_ids is None else segment_ids[:, step:],
                                                  attention_mask, k_v_past)
             last_token_hidden_states = hidden_states[:, -1, :]
+
+            ############### Logits Penalty ###############
+            if len(self.logits_processors) > 0:
+                for _processor in self.logits_processors:
+                    last_token_hidden_states = _processor(input_ids, last_token_hidden_states)
 
             ############### 选出得分最高的token ###############
             step_output = torch.argmax(last_token_hidden_states, dim=-1)

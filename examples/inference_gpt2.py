@@ -60,10 +60,13 @@ def sample_generate():
     encoded_input = tokenizer(text, return_tensors='pt', padding=True)
     print(encoded_input)
 
-    generation_configs = {'beam_size': 1,
-                          'max_gen_len': 100,
-                          'end_ids': tokenizer.convert_tokens_to_ids(eos_token),
-                          'pad_id': 0}
+    generation_configs = {
+        'beam_size': 1,
+        'max_gen_len': 100,
+        'end_ids': tokenizer.convert_tokens_to_ids(eos_token),
+        'pad_id': 0,
+        'no_repeat_ngram_size': 2,
+    }
 
     generated_sequence = model.generate(**encoded_input, generation_configs=generation_configs)
     generated_sequence = generated_sequence.numpy().tolist()
