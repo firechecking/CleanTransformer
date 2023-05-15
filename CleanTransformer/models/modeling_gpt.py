@@ -8,6 +8,7 @@
 
 import math, torch
 from CleanTransformer.transformer import LayerNorm
+from CleanTransformer.generation_util import GenerationMixin
 
 
 class GPTConfig():
@@ -64,13 +65,20 @@ class AttentionLayer(torch.nn.Module):
         x = x.view(b, s, self.n_head, -1)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states,
-                attention_mask=None,
-                head_mask=None):
+    def forward(self, hidden_states, layer_past=None,
+                attention_mask=None, head_mask=None,
+                return_kv=False):
         ############### 获取q、k、v ###############
         hidden_states = self.c_attn(hidden_states)
         q, k, v = hidden_states.split(self.n_state, dim=-1)
         q, k, v = self._split_m_head(q), self._split_m_head(k), self._split_m_head(v)
+
+        ############### 用于inference时的k、v计算复用 ###############
+        if layer_past is not None:
+            past_k, past_v = layer_past
+            k = torch.concat((past_k, k), dim=-2)
+            v = torch.concat((past_v, v), dim=-2)
+        layer_past = (k, v)
 
         ############### 获取weight ###############
         weight = torch.matmul(q, k.transpose(2, 3))
@@ -98,6 +106,8 @@ class AttentionLayer(torch.nn.Module):
         ############### v外面套一层Linear ###############
         v = self.c_proj(v)
         v = self.resid_dropout(v)
+        if return_kv:
+            return v, layer_past
         return v
 
 
@@ -176,7 +186,7 @@ class GPTModel(torch.nn.Module):
             return self.ln_f(hidden_states)
 
 
-class GPTLMHeadModel(torch.nn.Module):
+class GPTLMHeadModel(torch.nn.Module, GenerationMixin):
     def __init__(self, config, version='gpt'):
         super(GPTLMHeadModel, self).__init__()
         self.version = version
