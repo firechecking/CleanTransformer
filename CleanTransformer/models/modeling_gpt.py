@@ -8,7 +8,7 @@
 
 import math, torch
 from CleanTransformer.transformer import LayerNorm
-from CleanTransformer.generation_util import GenerationMixin
+from CleanTransformer.generation.generation_util import GenerationMixin
 
 
 class GPTConfig():

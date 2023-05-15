@@ -27,13 +27,14 @@ class GenerationMixin():
         beam_size = generation_configs.get('beam_size', 1)
         max_gen_len = generation_configs.get('max_gen_len', 100)
         end_ids = generation_configs.get('end_ids', None)
+        pad_id = generation_configs.get('pad_id', 0)
 
         if isinstance(end_ids, int): end_ids = [end_ids]
         end_ids_tensor = torch.tensor(list(end_ids)).to(input_ids.device) if end_ids is not None else None
 
         if beam_size == 1:
             return self._greedy_search(input_ids, attention_mask, position_ids, segment_ids,
-                                       end_ids_tensor, max_gen_len=max_gen_len)
+                                       end_ids_tensor, max_gen_len=max_gen_len, pad_id=pad_id)
 
     def _gen_next_token(self, x, position_ids, segment_ids, attention_mask, k_v_past):
         ############### 计算embedding ###############
@@ -61,11 +62,12 @@ class GenerationMixin():
 
         return hidden_states
 
-    def _greedy_search(self, input_ids, attention_mask, position_ids, segment_ids, end_ids_tensor, max_gen_len):
+    def _greedy_search(self, input_ids, attention_mask, position_ids, segment_ids, end_ids_tensor, max_gen_len, pad_id):
         bsz = input_ids.size(0)
         max_len = max_gen_len + input_ids.size(-1)
         k_v_past = [None for _ in self.gpt.blocks]
         step = 0
+        unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
         while True:
             ############### 计算下一个token的hidden_states （会复用k_v_past并更新k_v_past） ###############
             hidden_states = self._gen_next_token(input_ids[:, step:], position_ids[:, step:],
@@ -76,6 +78,13 @@ class GenerationMixin():
             ############### 选出得分最高的token ###############
             step_output = torch.argmax(last_token_hidden_states, dim=-1)
 
+            ############### 判断batch的每个case是否生成结束 ###############
+            step_output = step_output * unfinished_sequences + pad_id * (1 - unfinished_sequences)
+            if end_ids_tensor is not None:
+                unfinished_sequences = unfinished_sequences.mul(
+                    step_output.tile(end_ids_tensor.shape[0], 1).ne(end_ids_tensor.unsqueeze(1)).prod(dim=0)
+                )
+
             ############### 得到最新结果（将作为下一次的输入） ###############
             input_ids = torch.concat([input_ids, step_output[:, None]], dim=-1)
             position_ids = torch.concat([position_ids, (position_ids.max(dim=-1).values + 1).view(-1, 1)], dim=-1)
@@ -85,9 +94,7 @@ class GenerationMixin():
             step = input_ids.shape[1] - 1
 
             ############### 结束条件判断 ###############
-            if (end_ids_tensor is not None) and (input_ids[0][-1].item() in end_ids_tensor):
-                break
-            if step > max_len:
+            if unfinished_sequences.max() == 0 or step > max_len:
                 break
 
         return input_ids.view(bsz, 1, -1)

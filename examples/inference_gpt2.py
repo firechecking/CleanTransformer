@@ -49,31 +49,34 @@ def load_config(config_fn):
 
 
 def sample_generate():
-    text = "New York City plans to"
+    text = ["Hello, I'm a language model,", "The weather is fine today,"]
 
     config = load_config("../checkpoints/gpt2/config.json")
-    tokenizer = GPT2Tokenizer.from_pretrained('../checkpoints/gpt2')
+    tokenizer = GPT2Tokenizer.from_pretrained('../checkpoints/gpt2', padding_side='left')
     model = load_model(config, '../checkpoints/gpt2/pytorch_model.bin')
 
     eos_token = '<|endoftext|>'
-    encoded_input = tokenizer(text, return_tensors='pt')
+    tokenizer.pad_token_id = 0
+    encoded_input = tokenizer(text, return_tensors='pt', padding=True)
     print(encoded_input)
 
     generation_configs = {'beam_size': 1,
                           'max_gen_len': 100,
-                          'end_ids': tokenizer.convert_tokens_to_ids(eos_token)}
+                          'end_ids': tokenizer.convert_tokens_to_ids(eos_token),
+                          'pad_id': 0}
 
     generated_sequence = model.generate(**encoded_input, generation_configs=generation_configs)
     generated_sequence = generated_sequence.numpy().tolist()
     print(generated_sequence)
-    for sequences in generated_sequence:
-        for i, sequence in enumerate(sequences):
+    for i, sequences in enumerate(generated_sequence):
+        print('batch index: ', i)
+        for j, sequence in enumerate(sequences):
             text = tokenizer.decode(
                 sequence,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=True,
             )
-            print('beam: ', i, text)
+            print(text)
 
 
 if __name__ == "__main__":
