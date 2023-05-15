@@ -66,6 +66,10 @@ def sample_generate():
         'end_ids': tokenizer.convert_tokens_to_ids(eos_token),
         'pad_id': 0,
         'no_repeat_ngram_size': 2,
+        'do_sample': True,
+        'temperature': 0.8,
+        'top_k': 10,
+        'top_p': 0.8,
     }
 
     generated_sequence = model.generate(**encoded_input, generation_configs=generation_configs)

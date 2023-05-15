@@ -7,7 +7,7 @@
 # @Description: generation_util
 
 import torch
-from CleanTransformer.generation.logits_processor import NoRepeatNGramLogitsProcessor
+from CleanTransformer.generation.logits_processor import NoRepeatNGramLogitsProcessor, TemperatureLogitsWrapper, TopKLogitsWrapper, TopPLogitsWrapper
 
 
 class GenerationMixin():
@@ -30,6 +30,10 @@ class GenerationMixin():
         end_ids = generation_configs.get('end_ids', None)
         pad_id = generation_configs.get('pad_id', 0)
         no_repeat_ngram_size = generation_configs.get('no_repeat_ngram_size', 0)
+        self.do_sample = generation_configs.get('do_sample', True)
+        temperature = generation_configs.get('temperature', 1.0)
+        top_k = generation_configs.get('top_k', 10)
+        top_p = generation_configs.get('top_p', 0.8)
 
         if isinstance(end_ids, int): end_ids = [end_ids]
         end_ids_tensor = torch.tensor(list(end_ids)).to(input_ids.device) if end_ids is not None else None
@@ -37,6 +41,14 @@ class GenerationMixin():
         self.logits_processors = []
         if no_repeat_ngram_size > 1:
             self.logits_processors.append(NoRepeatNGramLogitsProcessor(no_repeat_ngram_size))
+
+        self.logits_wrapper = []
+        if self.do_sample and temperature != 1.0:
+            self.logits_wrapper.append(TemperatureLogitsWrapper(temperature))
+        if self.do_sample and top_k > 0:
+            self.logits_wrapper.append(TopKLogitsWrapper(top_k, min_tokens_to_keep=1))
+        if self.do_sample and top_p < 1.0:
+            self.logits_wrapper.append(TopPLogitsWrapper(top_p, min_tokens_to_keep=1))
 
         if beam_size == 1:
             return self._greedy_search(input_ids, attention_mask, position_ids, segment_ids,
@@ -86,8 +98,16 @@ class GenerationMixin():
                 for _processor in self.logits_processors:
                     last_token_hidden_states = _processor(input_ids, last_token_hidden_states)
 
-            ############### 选出得分最高的token ###############
-            step_output = torch.argmax(last_token_hidden_states, dim=-1)
+            if self.do_sample:
+                ############### Logits Sampling ###############
+                if len(self.logits_wrapper) > 0:
+                    for _wrapper in self.logits_wrapper:
+                        last_token_hidden_states = _wrapper(input_ids, last_token_hidden_states)
+                probs = torch.nn.functional.softmax(last_token_hidden_states, dim=-1)
+                step_output = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                ############### 选出得分最高的token ###############
+                step_output = torch.argmax(last_token_hidden_states, dim=-1)
 
             ############### 判断batch的每个case是否生成结束 ###############
             step_output = step_output * unfinished_sequences + pad_id * (1 - unfinished_sequences)
