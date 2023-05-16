@@ -34,6 +34,7 @@ class GenerationMixin():
         temperature = generation_configs.get('temperature', 1.0)
         top_k = generation_configs.get('top_k', 10)
         top_p = generation_configs.get('top_p', 0.8)
+        early_stop = generation_configs.get('early_stop', True)
 
         if isinstance(end_ids, int): end_ids = [end_ids]
         end_ids_tensor = torch.tensor(list(end_ids)).to(input_ids.device) if end_ids is not None else None
@@ -56,7 +57,7 @@ class GenerationMixin():
         else:
             return self._beam_search(input_ids, attention_mask, position_ids, segment_ids,
                                      end_ids_tensor, max_gen_len=max_gen_len, pad_id=pad_id,
-                                     beam_size=beam_size)
+                                     beam_size=beam_size, early_stop=early_stop)
 
     def _gen_next_token(self, x, position_ids, segment_ids, attention_mask, k_v_past):
         ############### 计算embedding ###############
@@ -134,6 +135,65 @@ class GenerationMixin():
 
         return input_ids.view(bsz, 1, -1)
 
+    def _update_beam_infos(self, beam, generated_beam_infos, input_ids, token_indices, next_tokens, probs, end_ids_tensor,
+                           pad_token_id,
+                           length_penalty=1.0,
+                           early_stop=True):
+        bsz = next_tokens.shape[0]
+        device = input_ids.device
+        ############### 保存next_tokens (非end_id)以及来自于哪个beam ###############
+        new_indices = torch.zeros((bsz, beam), dtype=token_indices.dtype, device=device)
+        new_tokens = torch.zeros((bsz, beam), dtype=next_tokens.dtype, device=device)
+        new_probs = torch.zeros((bsz, beam), dtype=probs.dtype, device=device)
+
+        for batch_i in range(bsz):
+            candi_generation = generated_beam_infos[batch_i]['candi_generation']
+            ############### 如果当前batch_i生成已结束，token替换为pad ###############
+            if generated_beam_infos[batch_i]['is_done']:
+                new_tokens[batch_i, :] = pad_token_id
+                continue
+
+            valid_beam_i = 0
+            for beam_i in range(beam):
+                if next_tokens[batch_i, beam_i].item() in end_ids_tensor:
+                    ############### 对于每个batch_i，首先产生不少于beam_size个候选（每个候选以end_id结尾） ###############
+                    if beam_i >= beam: continue  # 在beam_size之后的end_id分数过低，不要
+                    choice_idx = beam * batch_i + token_indices[batch_i, beam_i]
+                    score = probs[batch_i, beam_i] / (input_ids.shape[-1] ** length_penalty)  # TODO: 这里文本长度是否需要去掉padding？
+                    candi_generation.append({"ids": input_ids[choice_idx],
+                                             "score": score})
+                    ############### 如果候选大于beam_size，则剔除分数最低的候选 ###############
+                    if len(candi_generation) > beam:
+                        sorted_scores = sorted([(candi['score'], idx) for idx, candi in enumerate(candi_generation)])
+                        del candi_generation[sorted_scores[0][1]]
+                        generated_beam_infos[batch_i]['worst_score'] = sorted_scores[1][0]
+                    else:
+                        generated_beam_infos[batch_i]['worst_score'] = min(score, generated_beam_infos[batch_i]['worst_score'])
+                else:
+                    ############### 没结束前，要尽量保证有beam_size个next_tokens (非end_id)可用于下次输入 ###############
+                    new_indices[batch_i, valid_beam_i] = token_indices[batch_i, beam_i]
+                    new_tokens[batch_i, valid_beam_i] = next_tokens[batch_i, beam_i]
+                    new_probs[batch_i, valid_beam_i] = probs[batch_i, beam_i]
+                    valid_beam_i += 1
+
+                if valid_beam_i >= beam:
+                    break
+
+            generated_beam_infos[batch_i]['candi_generation'] = candi_generation
+
+            if len(candi_generation) >= beam:
+                ############### 结束条件1: 产生beam_size个候选后，且early_stop，则结束 ###############
+                if early_stop:
+                    generated_beam_infos[batch_i]['is_done'] = True
+                    continue
+                ############### 结束条件2: 产生beam_size个候选的最低分数，已经比未来可能产生的最大分数更高，则结束 ###############
+                next_highest_prob = probs[batch_i].max().item()
+                next_highest_score = next_highest_prob / ((input_ids.shape[-1] + 1) ** length_penalty)
+                if generated_beam_infos[batch_i]['worst_score'] > next_highest_score:
+                    generated_beam_infos[batch_i]['is_done'] = True
+
+        return generated_beam_infos, new_indices, new_tokens, new_probs
+
     def _beam_topk(self, x_ids, bsz, beam_size, last_token_hidden_states, probs):
         scores = torch.nn.functional.log_softmax(last_token_hidden_states, dim=-1)
         vocab_size = scores.shape[-1]
@@ -141,14 +201,14 @@ class GenerationMixin():
         scores = scores + probs
         scores = scores.view(bsz, -1)
 
-        probs, next_tokens = scores.topk(beam_size, dim=1, largest=True, sorted=True)
+        probs, next_tokens = scores.topk(2 * beam_size, dim=1, largest=True, sorted=True)
 
         ############### 确定next_tokens以及来自于哪个beam ###############
         token_indices = torch.div(next_tokens, vocab_size, rounding_mode="floor")
         next_tokens = next_tokens % vocab_size
         return token_indices, next_tokens, probs
 
-    def _beam_search(self, input_ids, attention_mask, position_ids, segment_ids, end_ids_tensor, max_gen_len, pad_id, beam_size):
+    def _beam_search(self, input_ids, attention_mask, position_ids, segment_ids, end_ids_tensor, max_gen_len, pad_id, beam_size, early_stop):
         bsz = input_ids.size(0)
         max_len = max_gen_len + input_ids.size(-1)
         k_v_past = [None for _ in self.gpt.blocks]
@@ -164,6 +224,9 @@ class GenerationMixin():
         probs = torch.zeros((bsz, beam_size), device=input_ids.device)
         probs[:, 1:] = -1e9  # 第一次输入时，每个beam都一样，为防止从每个beam中都选出同一个最大token，第一次只从beam 1中选token
 
+        ############### 记录每个case状态 ###############
+        generated_beam_infos = [{'is_done': False, 'worst_score': 1e9, 'candi_generation': []} for _ in range(bsz)]
+
         while True:
             hidden_states = self._gen_next_token(input_ids[:, step:], position_ids[:, step:],
                                                  None if segment_ids is None else segment_ids[:, step:],
@@ -172,6 +235,11 @@ class GenerationMixin():
 
             ############### 获取top_k的next_tokens ###############
             token_indices, step_output, probs = self._beam_topk(input_ids, bsz, beam_size, last_token_hidden_states, probs=probs)
+
+            generated_beam_infos, token_indices, step_output, probs = self._update_beam_infos(beam_size, generated_beam_infos, input_ids,
+                                                                                              token_indices, step_output, probs,
+                                                                                              end_ids_tensor, pad_token_id=pad_id,
+                                                                                              early_stop=early_stop)
 
             def concat_new(value, name):
                 if value is None: return None
