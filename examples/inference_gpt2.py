@@ -61,7 +61,7 @@ def sample_generate():
     print(encoded_input)
 
     generation_configs = {
-        'beam_size': 1,
+        'beam_size': 3,
         'max_gen_len': 100,
         'end_ids': tokenizer.convert_tokens_to_ids(eos_token),
         'pad_id': 0,
@@ -83,7 +83,7 @@ def sample_generate():
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=True,
             )
-            print(text)
+            print('beam: ', j, text)
 
 
 if __name__ == "__main__":
