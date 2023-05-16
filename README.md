@@ -19,7 +19,7 @@
 - [x] 分词器Tokenizer: BPE, WordPiece
 - [x] 原始Transformer: LayerNorm, Multi-Head Attention, TransformerLayer
 - [x] 完整模型搭建及推理: Bert, GPT1/2/3, Bert Inference
-- [ ] 生成策略: Greedy Search, Beam Search
+- [x] 生成策略: Greedy Search, Beam Search, Logits Penalty, Logits Sampling
 - [ ] 模型训练: Optimizer (SGD, Adam), Loss (MSELoss, CrossEntropyLoss), Trainer, Deployment
 - [ ] 类ChatGPT模型训练: LLaMA + SFT + RLHF
 - [ ] 训练及推理加速: Data Parallel, Tensor Parallel, Pipeline Parallel, Activition Checkpoint, Model Quantization
