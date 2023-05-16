@@ -44,6 +44,7 @@ class GenerationMixin():
             self.logits_processors.append(NoRepeatNGramLogitsProcessor(no_repeat_ngram_size))
 
         self.logits_wrapper = []
+        self.temperature = temperature
         if self.do_sample and temperature != 1.0:
             self.logits_wrapper.append(TemperatureLogitsWrapper(temperature))
         if self.do_sample and top_k > 0:
@@ -198,10 +199,23 @@ class GenerationMixin():
         scores = torch.nn.functional.log_softmax(last_token_hidden_states, dim=-1)
         vocab_size = scores.shape[-1]
         probs = probs.view(-1, 1).expand_as(scores)
-        scores = scores + probs
+        if self.do_sample:
+            scores = scores + probs * self.temperature
+        else:
+            scores = scores + probs
         scores = scores.view(bsz, -1)
 
-        probs, next_tokens = scores.topk(2 * beam_size, dim=1, largest=True, sorted=True)
+        if self.do_sample:
+            if len(self.logits_wrapper) > 0:
+                for _wrapper in self.logits_wrapper:
+                    scores = _wrapper(x_ids, scores)
+            probs = torch.nn.functional.softmax(scores, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=2 * beam_size)
+            probs = torch.gather(scores, -1, next_tokens)
+            probs, _indices = torch.sort(probs, descending=True, dim=1)
+            next_tokens = torch.gather(next_tokens, -1, _indices)
+        else:
+            probs, next_tokens = scores.topk(2 * beam_size, dim=1, largest=True, sorted=True)
 
         ############### 确定next_tokens以及来自于哪个beam ###############
         token_indices = torch.div(next_tokens, vocab_size, rounding_mode="floor")
@@ -232,6 +246,11 @@ class GenerationMixin():
                                                  None if segment_ids is None else segment_ids[:, step:],
                                                  attention_mask, k_v_past)
             last_token_hidden_states = hidden_states[:, -1, :]
+
+            if len(self.logits_processors) > 0:
+                last_token_hidden_states = last_token_hidden_states.view(bsz * beam_size, -1)
+                for logit_processor in self.logits_processors:
+                    last_token_hidden_states = logit_processor(input_ids, last_token_hidden_states)
 
             ############### 获取top_k的next_tokens ###############
             token_indices, step_output, probs = self._beam_topk(input_ids, bsz, beam_size, last_token_hidden_states, probs=probs)
