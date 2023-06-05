@@ -1,4 +1,5 @@
 *.idea
 checkpoints
+datasets
 *.pyc
 __pycache__

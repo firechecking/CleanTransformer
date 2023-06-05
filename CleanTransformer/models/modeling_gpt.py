@@ -65,20 +65,19 @@ class AttentionLayer(torch.nn.Module):
         x = x.view(b, s, self.n_head, -1)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states, layer_past=None,
-                attention_mask=None, head_mask=None,
-                return_kv=False):
+    def forward(self, hidden_states, k_v_past=None,
+                attention_mask=None, head_mask=None):
         ############### 获取q、k、v ###############
         hidden_states = self.c_attn(hidden_states)
         q, k, v = hidden_states.split(self.n_state, dim=-1)
         q, k, v = self._split_m_head(q), self._split_m_head(k), self._split_m_head(v)
 
         ############### 用于inference时的k、v计算复用 ###############
-        if layer_past is not None:
-            past_k, past_v = layer_past
+        if k_v_past is not None:
+            past_k, past_v = k_v_past
             k = torch.concat((past_k, k), dim=-2)
             v = torch.concat((past_v, v), dim=-2)
-        layer_past = (k, v)
+        k_v_past = (k, v)
 
         ############### 获取weight ###############
         weight = torch.matmul(q, k.transpose(2, 3))
@@ -106,9 +105,8 @@ class AttentionLayer(torch.nn.Module):
         ############### v外面套一层Linear ###############
         v = self.c_proj(v)
         v = self.resid_dropout(v)
-        if return_kv:
-            return v, layer_past
-        return v
+
+        return v, k_v_past
 
 
 class NewGELUActivation(torch.nn.Module):
@@ -139,20 +137,20 @@ class TransformerBlock(torch.nn.Module):
         )
         self.norm2 = LayerNorm(n_embd, eps=config.layer_norm_epsilon)
 
-    def forward(self, x, attn_output=None, attention_mask=None, head_mask=None):
+    def forward(self, x, attn_output=None, attention_mask=None, head_mask=None, k_v_past=None):
         if self.version == 'gpt':  # gpt1
             if attn_output is None:
-                attn_output = self.attn(x, attention_mask=attention_mask, head_mask=head_mask)
+                attn_output, k_v_past = self.attn(x, attention_mask=attention_mask, head_mask=head_mask, k_v_past=k_v_past)
             norm1_output = self.norm1(x + attn_output)
             mlp_output = self.mlp(norm1_output)
             output = self.norm2(norm1_output + mlp_output)
         else:  # gpt2/3
             if attn_output is None:
-                attn_output = self.attn(self.norm1(x), attention_mask=attention_mask, head_mask=head_mask)
+                attn_output, k_v_past = self.attn(self.norm1(x), attention_mask=attention_mask, head_mask=head_mask, k_v_past=k_v_past)
             x = x + attn_output
             mlp_output = self.mlp(self.norm2(x))
             output = x + mlp_output
-        return output
+        return output, k_v_past
 
 
 class GPTModel(torch.nn.Module):
@@ -167,23 +165,34 @@ class GPTModel(torch.nn.Module):
         if version != 'gpt':
             self.ln_f = LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
 
-    def forward(self, input_ids, attention_mask=None, position_ids=None, segment_ids=None):
+    def forward(self, input_ids, attention_mask=None, position_ids=None, segment_ids=None, k_v_pasts=None):
+        input_embeds = self.tokens_embed(input_ids)
+
+        if position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = position_ids[:, -input_embeds.shape[1]:]
+
         if attention_mask is not None:
             attention_mask = attention_mask[:, None, None, :]
-            attention_mask = (1.0 - attention_mask) * -10000.0
+            attention_mask = attention_mask.to(dtype=input_embeds.dtype)
+            attention_mask = (1.0 - attention_mask) * torch.finfo(attention_mask.dtype).min
 
-        input_embeds = self.tokens_embed(input_ids)
+        if k_v_pasts is None:
+            k_v_pasts = [None] * len(self.blocks)
+
         position_embeds = self.position_embed(position_ids)
-        segment_embeds = self.tokens_embed(segment_ids)
+
+        segment_embeds = 0 if segment_ids is None else self.tokens_embed(segment_ids.view(-1, segment_ids.size(-1)))
 
         hidden_states = self.drop(input_embeds + position_embeds + segment_embeds)
-        for block in self.blocks:
-            hidden_states = block(hidden_states, attention_mask=attention_mask)
+        for i, block in enumerate(self.blocks):
+            hidden_states, k_v_pasts[i] = block(hidden_states, attention_mask=attention_mask, k_v_past=k_v_pasts[i])
 
         if self.version == 'gpt':
-            return hidden_states
+            return hidden_states, k_v_pasts
         else:
-            return self.ln_f(hidden_states)
+            return self.ln_f(hidden_states), k_v_pasts
 
 
 class GPTLMHeadModel(torch.nn.Module, GenerationMixin):
@@ -197,11 +206,11 @@ class GPTLMHeadModel(torch.nn.Module, GenerationMixin):
     def _tie_weights(self):
         self.lm_head.weight = self.gpt.tokens_embed.weight
 
-    def forward(self, input_ids, attention_mask=None, segment_ids=None, position_ids=None):
-        hidden_states = self.gpt(input_ids, attention_mask, segment_ids, position_ids)
+    def forward(self, input_ids, attention_mask=None, segment_ids=None, position_ids=None, k_v_pasts=None):
+        hidden_states, k_v_pasts = self.gpt(input_ids, attention_mask, position_ids, segment_ids, k_v_pasts)
         lm_logits = self.lm_head(hidden_states)
         outputs = (lm_logits, hidden_states)
-        return outputs
+        return outputs, k_v_pasts
 
 
 def sample_conv1d():
