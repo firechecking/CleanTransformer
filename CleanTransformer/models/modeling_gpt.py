@@ -198,6 +198,7 @@ class GPTModel(torch.nn.Module):
 class GPTLMHeadModel(torch.nn.Module, GenerationMixin):
     def __init__(self, config, version='gpt'):
         super(GPTLMHeadModel, self).__init__()
+        self.config = config
         self.version = version
         self.gpt = GPTModel(config, version=version)
         self.lm_head = torch.nn.Linear(config.n_embd, config.vocab_size, bias=False)

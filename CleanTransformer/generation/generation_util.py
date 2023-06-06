@@ -56,7 +56,7 @@ class GenerationMixin():
     def _greedy_search(self, input_ids, attention_mask, position_ids, segment_ids, end_ids_tensor, max_gen_len, pad_id):
         bsz = input_ids.size(0)
         max_len = max_gen_len + input_ids.size(-1)
-        k_v_pasts = [None for _ in self.gpt.blocks]
+        k_v_pasts = [None for _ in range(self.config.n_layer)]
         step = 0
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
         while True:
@@ -195,7 +195,7 @@ class GenerationMixin():
     def _beam_search(self, input_ids, attention_mask, position_ids, segment_ids, end_ids_tensor, max_gen_len, pad_id, beam_size, early_stop):
         bsz = input_ids.size(0)
         max_len = max_gen_len + input_ids.size(-1)
-        k_v_pasts = [None for _ in self.gpt.blocks]
+        k_v_pasts = [None for _ in range(self.config.n_layer)]
         step = 0
 
         ############### 将所有输入扩展成beam_size份 ###############
