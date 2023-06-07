@@ -9,6 +9,7 @@
 import math
 import torch
 from torch.nn import CrossEntropyLoss
+# from CleanTransformer.loss import CrossEntropyLoss
 from CleanTransformer.transformer import LayerNorm
 from CleanTransformer.generation.generation_util import GenerationMixin
 
