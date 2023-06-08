@@ -16,8 +16,7 @@ class GenerationMixin():
         self.gpt = None
         self.version = None
 
-    def generate(self, input_ids, attention_mask=None, position_ids=None, segment_ids=None, generation_configs={}):
-
+    def generate(self, input_ids, attention_mask=None, position_ids=None, segment_ids=None, generation_configs={}, steamers=None):
         beam_size = generation_configs.get('beam_size', 1)
         max_gen_len = generation_configs.get('max_gen_len', 100)
         end_ids = generation_configs.get('end_ids', None)
@@ -44,6 +43,8 @@ class GenerationMixin():
             self.logits_wrapper.append(TopKLogitsWrapper(top_k, min_tokens_to_keep=1))
         if self.do_sample and top_p < 1.0:
             self.logits_wrapper.append(TopPLogitsWrapper(top_p, min_tokens_to_keep=1))
+
+        self.steamers = steamers
 
         if beam_size == 1:
             return self._greedy_search(input_ids, attention_mask, position_ids, segment_ids,
@@ -98,6 +99,17 @@ class GenerationMixin():
             segment_ids = None if segment_ids is None else torch.concat([segment_ids, segment_ids[:, -1:]], dim=-1)
             # attention_mask = torch.concat([attention_mask, -attention_mask.new_zeros((*attention_mask.shape[:-1], 1))], dim=-1)
             attention_mask = torch.concat([attention_mask, attention_mask[:, -1:]], dim=-1)
+
+            ############### 流式结果输出 ###############
+            steamer_finish = False
+            if self.steamers is not None:
+                self.steamers = self.steamers if isinstance(self.steamers, list) else [self.steamers, ]
+                for steamer in self.steamers:
+                    if callable(steamer):
+                        _finish = steamer(input_ids.view(bsz, 1, -1))
+                        steamer_finish = steamer_finish or _finish
+            if steamer_finish:
+                break
 
             ############### 结束条件判断 ###############
             step = input_ids.shape[1] - 1
@@ -258,6 +270,17 @@ class GenerationMixin():
                 for state_past in layer_past:
                     _states.append(state_past.index_select(0, token_indices.view(-1)))
                 k_v_pasts[i] = tuple(_states)
+
+            ############### 流式结果输出 ###############
+            steamer_finish = False
+            if self.steamers is not None:
+                self.steamers = self.steamers if isinstance(self.steamers, list) else [self.steamers, ]
+                for steamer in self.steamers:
+                    if callable(steamer):
+                        _finish = steamer(input_ids.view(bsz, beam_size, -1))
+                        steamer_finish = steamer_finish or _finish
+            if steamer_finish:
+                break
 
             # END判断
             step = input_ids.shape[1] - 1
