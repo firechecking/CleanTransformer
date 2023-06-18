@@ -17,6 +17,7 @@ def wordpunct_tokenize(text):
 
 
 class BPETokenizer():
+    special = ["<UNK>", "<PAD>", "<END>", "<MASK>"]
     def __init__(self, vocab_size=1000, lowercase=True, basic_tokenizer=wordpunct_tokenize,
                  unk='<UNK>', sep='<SEP>', pad='<PAD>', cls='<CLS>', mask='<MASK>'):
         self.lowercase = lowercase
@@ -84,7 +85,7 @@ class BPETokenizer():
         bi_cnt = bigram_counter.get(max_bigram)
 
         ############### 从corpus中将最大二元组出现的地方替换成一个token ###############
-        for token in word_corpus:
+        for token in list(word_corpus.keys()):
             _new_token = tuple(' '.join(token).replace(' '.join(max_bigram), ''.join(max_bigram)).split(' '))
             if _new_token != token:
                 word_corpus[_new_token] = word_corpus[token]
@@ -171,7 +172,7 @@ class WordPieceTokenizer(BPETokenizer):
         else:
             return word_corpus, -1
         bi_cnt = max(bigram_counter.values())
-        for token in word_corpus:
+        for token in list(word_corpus.keys()):
             _new_token = tuple(' '.join(token).replace(' '.join(max_bigram), ''.join(max_bigram)).split(' '))
             if _new_token != token:
                 word_corpus[_new_token] = word_corpus[token]
