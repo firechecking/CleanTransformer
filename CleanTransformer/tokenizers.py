@@ -18,11 +18,13 @@ def wordpunct_tokenize(text):
 
 class BPETokenizer():
     def __init__(self, vocab_size=1000, lowercase=True, basic_tokenizer=wordpunct_tokenize,
-                 unk='<UNK>', sep='<SEP>', pad='<PAD>', cls='<CLS>', mask='<MASK>'):
+                 unk='<UNK>', sep='<SEP>', pad='<PAD>', cls='<CLS>', mask='<MASK>', user_specials=None):
         self.lowercase = lowercase
         self.vocab_size = vocab_size
         self.basic_tokenizer = basic_tokenizer
         self.unk, self.sep, self.pad, self.cls, self.mask = unk, sep, pad, cls, mask
+        self.special = [unk, sep, pad, cls, mask]
+        self.special.extend(user_specials if user_specials else [])
 
     def load(self, vocab_fn=None, vocab=None):
         if vocab:
@@ -71,9 +73,9 @@ class BPETokenizer():
         bigram_counter = Counter()
 
         ############### 以步长1，窗口尺寸2，在每个单词上滚动，统计二元组频次 ###############
-        for token, count in word_corpus.items():
-            if len(token) < 2: continue
-            for bigram in toolz.sliding_window(ngram, token):
+        for tokens, count in word_corpus.items():
+            if len(tokens) < 2: continue
+            for bigram in toolz.sliding_window(ngram, tokens):
                 bigram_counter[bigram] += count
 
         ############### 选出频次最大的二元组 ###############
@@ -84,11 +86,12 @@ class BPETokenizer():
         bi_cnt = bigram_counter.get(max_bigram)
 
         ############### 从corpus中将最大二元组出现的地方替换成一个token ###############
-        for token in word_corpus:
-            _new_token = tuple(' '.join(token).replace(' '.join(max_bigram), ''.join(max_bigram)).split(' '))
-            if _new_token != token:
-                word_corpus[_new_token] = word_corpus[token]
-                word_corpus.pop(token)
+        words_tokens = list(word_corpus.keys())
+        for tokens in words_tokens:
+            _new_tokens = tuple(' '.join(tokens).replace(' '.join(max_bigram), ''.join(max_bigram)).split(' '))
+            if _new_tokens != tokens:
+                word_corpus[_new_tokens] = word_corpus[tokens]
+                word_corpus.pop(tokens)
         return word_corpus, bi_cnt
 
     def tokenize(self, text: str, add_pre=None, add_mid=None, add_post='</w>'):
@@ -171,11 +174,13 @@ class WordPieceTokenizer(BPETokenizer):
         else:
             return word_corpus, -1
         bi_cnt = max(bigram_counter.values())
-        for token in word_corpus:
-            _new_token = tuple(' '.join(token).replace(' '.join(max_bigram), ''.join(max_bigram)).split(' '))
-            if _new_token != token:
-                word_corpus[_new_token] = word_corpus[token]
-                word_corpus.pop(token)
+
+        words_tokens = list(word_corpus.keys())
+        for tokens in words_tokens:
+            _new_tokens = tuple(' '.join(tokens).replace(' '.join(max_bigram), ''.join(max_bigram)).split(' '))
+            if _new_tokens != tokens:
+                word_corpus[_new_tokens] = word_corpus[tokens]
+                word_corpus.pop(tokens)
         return word_corpus, bi_cnt
 
 

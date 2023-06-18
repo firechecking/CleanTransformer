@@ -3,3 +3,4 @@ checkpoints
 datasets
 *.pyc
 __pycache__
+*.txt
