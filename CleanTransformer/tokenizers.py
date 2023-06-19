@@ -32,8 +32,6 @@ class BPETokenizer():
         else:
             self.vocab = [l.strip() for l in open(vocab_fn, 'r').readlines()]
         self.vocab_size = len(self.vocab)
-        self.id2token = {i: v for i, v in enumerate(self.vocab)}
-        self.token2id = {v: i for i, v in self.id2token.items()}
 
     def fit(self, corpus: list, max_steps=10000, out_fn='vocab.txt'):
         '''
@@ -141,7 +139,7 @@ class BPETokenizer():
         将text转换成token_ids
         '''
         tokens_list = self.tokenize(text)
-        ids_list = [list(map(lambda x: self._token2id[x], tokens)) for tokens in tokens_list]
+        ids_list = [list(map(lambda x: self._token2id(x), tokens)) for tokens in tokens_list]
         return ids_list
 
     def decode(self, token_ids):
@@ -150,7 +148,7 @@ class BPETokenizer():
         '''
         sentences = []
         for ids in token_ids:
-            sentence = list(map(lambda x: self._id2token[x], ids))
+            sentence = list(map(lambda x: self._id2token(x), ids))
             sentence = ''.join(sentence).replace('</w>', ' ')
             sentences.append(sentence)
         return sentences
@@ -196,6 +194,7 @@ def bpe_sample():
 
     print(bpe.vocab)
     print(bpe.tokenize('Object raspberrypi functools dict kwargs'))
+    print(bpe.encode("Object raspberrypi functools dict kwargs"))
 
 
 def wp_sample():
