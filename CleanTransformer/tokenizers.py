@@ -102,6 +102,7 @@ class BPETokenizer():
 
         ############### 简单分词，并遍历token ###############
         for token in self.basic_tokenizer(text):
+            new_token = []
             token = list(token)
             token = [add_pre] + token if add_pre else token
             token = token + [add_post] if add_post else token
@@ -115,15 +116,16 @@ class BPETokenizer():
                     sub_token = add_mid + sub_token
 
                 if sub_token in self.vocab:
-                    all_tokens.append(sub_token)
+                    new_token.append(sub_token)
                     start = end
                     end = len(token)
                 elif end - start == 1:
-                    all_tokens.append(self.unk)
+                    new_token.append(self.unk)
                     start = end
                     end = len(token)
                 else:
                     end -= 1
+            all_tokens.append(new_token)
         return all_tokens
 
     def _token2id(self, token):
@@ -195,6 +197,7 @@ def bpe_sample():
     print(bpe.vocab)
     print(bpe.tokenize('Object raspberrypi functools dict kwargs'))
     print(bpe.encode("Object raspberrypi functools dict kwargs"))
+    print(bpe.decode(bpe.encode("Object raspberrypi functools dict kwargs")))
 
 
 def wp_sample():
