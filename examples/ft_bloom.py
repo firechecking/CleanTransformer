@@ -6,9 +6,10 @@
 # @Software: CleanTransformer
 # @Description: ft_bloom
 
-import os, json, argparse
+import os, json, sys, argparse
 from functools import partial
 import numpy as np
+sys.path.append('.')
 
 import torch
 from torch.utils.data import Dataset, DataLoader
