@@ -38,6 +38,19 @@
   * SGD、SGD+Momentum、SGD+Momentum+Weight Decay、AdaGrad、AdaDelta/RMSProp、AdamW原理、推导、代码实现
   * Dataset、DataLoader、TrainLoop代码实现
   * 流式生成、SFT后模型效果对比
+* [自动混合精度](https://www.zhihu.com/question/306508382/answer/3253039603)
+  * 自动混合精度O0，O1，O2，O3对比
+  * 核心功能实现：cast_model_type、cast_model_outputs、cast_model_outputs、patch_torch_functions、patch_torch_functions
+  * 扩展阅读：optimizer中的参数及方法
+
+* [数据并行：DistributedDataParallel](https://www.zhihu.com/question/53851014/answer/3271802850)
+  * 模型参数同步
+  * grad的分组同步buckets构建、并行同步代码实现
+  * 扩展阅读：
+    * forward、backward计算过程详解
+    * grad_fn、next_functions详解
+    * register_hook详解
+
 
 ## 计划
 
@@ -47,5 +60,5 @@
 - [x] 生成策略: Greedy Search, Beam Search, Logits Penalty, Logits Sampling
 - [x] 模型训练: Optimizer (SGD, Adam), Loss (MSELoss, CrossEntropyLoss), Trainer, Deployment
 - [x] 类ChatGPT模型训练: Bloom + SFT ~~+ RLHF~~
-- [ ] 训练及推理加速: Data Parallel, Tensor Parallel, Pipeline Parallel, Activition Checkpoint, Model Quantization
+- [ ] （部分已完成）训练及推理加速: Data Parallel, Tensor Parallel, Pipeline Parallel, Activition Checkpoint, Model Quantization
 - [ ] 文生图: Diffusion Model

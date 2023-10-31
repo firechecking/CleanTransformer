@@ -67,10 +67,11 @@ class BelleDataset(Dataset):
 
 def build_dataloader(tokenizer, data_fn, batch_size, shuffle, max_length=1024):
     dataset = BelleDataset(data_fn)
+    ############### DistributedSampler ###############
     datasampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=shuffle)
     dataloader = DataLoader(dataset, batch_size=batch_size,
                             shuffle=False,
-                            sampler=datasampler,
+                            sampler=datasampler,  # 使用sampler时，shuffle设置为False
                             collate_fn=partial(BelleDataset.collate_fn, tokenizer=tokenizer, max_length=max_length))
     return dataloader
 
@@ -81,8 +82,8 @@ def train(model, train_loader, epoches, save_interval=1000, print_interval=10, s
     if (apex_level != None) and (apex_level not in ['O0', 'O1', 'O2', 'O3']):
         raise Exception('apex_level只能设置为O0,O1,O2,O3。当前值apex_level={}'.format(apex_level))
 
-    local_rank = int(os.environ["LOCAL_RANK"])
     ############### 判断gpu or cpu ###############
+    local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
 
