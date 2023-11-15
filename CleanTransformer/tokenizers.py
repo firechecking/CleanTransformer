@@ -32,8 +32,6 @@ class BPETokenizer():
         else:
             self.vocab = [l.strip() for l in open(vocab_fn, 'r').readlines()]
         self.vocab_size = len(self.vocab)
-        self.id2token = {i: v for i, v in enumerate(self.vocab)}
-        self.token2id = {v: i for i, v in self.id2token.items()}
 
     def fit(self, corpus: list, max_steps=10000, out_fn='vocab.txt'):
         '''
@@ -104,6 +102,7 @@ class BPETokenizer():
 
         ############### 简单分词，并遍历token ###############
         for token in self.basic_tokenizer(text):
+            new_token = []
             token = list(token)
             token = [add_pre] + token if add_pre else token
             token = token + [add_post] if add_post else token
@@ -117,15 +116,16 @@ class BPETokenizer():
                     sub_token = add_mid + sub_token
 
                 if sub_token in self.vocab:
-                    all_tokens.append(sub_token)
+                    new_token.append(sub_token)
                     start = end
                     end = len(token)
                 elif end - start == 1:
-                    all_tokens.append(self.unk)
+                    new_token.append(self.unk)
                     start = end
                     end = len(token)
                 else:
                     end -= 1
+            all_tokens.append(new_token)
         return all_tokens
 
     def _token2id(self, token):
@@ -141,7 +141,7 @@ class BPETokenizer():
         将text转换成token_ids
         '''
         tokens_list = self.tokenize(text)
-        ids_list = [list(map(lambda x: self._token2id[x], tokens)) for tokens in tokens_list]
+        ids_list = [list(map(lambda x: self._token2id(x), tokens)) for tokens in tokens_list]
         return ids_list
 
     def decode(self, token_ids):
@@ -150,7 +150,7 @@ class BPETokenizer():
         '''
         sentences = []
         for ids in token_ids:
-            sentence = list(map(lambda x: self._id2token[x], ids))
+            sentence = list(map(lambda x: self._id2token(x), ids))
             sentence = ''.join(sentence).replace('</w>', ' ')
             sentences.append(sentence)
         return sentences
@@ -196,6 +196,8 @@ def bpe_sample():
 
     print(bpe.vocab)
     print(bpe.tokenize('Object raspberrypi functools dict kwargs'))
+    print(bpe.encode("Object raspberrypi functools dict kwargs"))
+    print(bpe.decode(bpe.encode("Object raspberrypi functools dict kwargs")))
 
 
 def wp_sample():
