@@ -12,10 +12,12 @@ from contextlib import contextmanager
 from typing import Mapping
 
 import torch
+import numpy as np
 from torch.utils.data import (
     Dataset,
     DataLoader,
     RandomSampler,
+    SequentialSampler,
 )
 
 import datasets
@@ -35,6 +37,7 @@ from accelerate.utils import (
 )
 from transformers.utils import (
     find_labels,
+    can_return_loss,
     is_datasets_available,
     is_accelerate_available,
 )
@@ -48,8 +51,11 @@ from transformers.trainer_utils import (
     has_length,
     seed_worker,
     TrainOutput,
+    EvalPrediction,
+    EvalLoopOutput,
     number_of_arguments,
     RemoveColumnsCollator,
+    denumpify_detensorize,
 )
 from transformers.training_args import (
     ParallelMode,
@@ -58,6 +64,9 @@ from transformers.modeling_utils import (
     unwrap_model,
 )
 from transformers.trainer_pt_utils import (
+    nested_detach,
+    find_batch_size,
+    EvalLoopContainer,
     get_parameter_names,
     LengthGroupedSampler,
     IterableDatasetShard,
@@ -340,6 +349,200 @@ class Trainer():
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         return (loss, outputs) if return_outputs else loss
 
+    def __评测流程__(self):
+        pass
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        ############### 评测数据准备 ###############
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if isinstance(eval_dataset, dict):
+            metrics = {}
+            for eval_dataset_name, _eval_dataset in eval_dataset.items():
+                dataset_metrics = self.evaluate(
+                    eval_dataset=_eval_dataset,
+                    ignore_keys=ignore_keys,
+                    metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
+                )
+                metrics.update(dataset_metrics)
+            return metrics
+
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+
+        ############### 调用评测循环 ###############
+        output = self.evaluation_loop(
+            eval_dataloader,
+            description="Evaluation",
+            prediction_loss_only=True if self.compute_metrics is None else None,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+
+        return output.metrics
+
+    def evaluation_loop(self, dataloader, description, prediction_loss_only=None, ignore_keys=None, metric_key_prefix='eval'):
+        args = self.args
+        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
+
+        with CodeBlock("处理model"):
+            # 处理逻辑和train()差不多，如果是在训练过程中进入evaluate()，model不会被重复处理
+            if self.is_deepspeed_enabled and self.deepspeed is None:
+                _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
+
+            model = self._wrap_model(self.model, training=False)
+            if len(self.accelerator._models) == 0 and model is self.model:
+                model = (
+                    self.accelerator.prepare(model)
+                    if self.is_deepspeed_enabled
+                    else self.accelerator.prepare_model(model, evaluation_mode=True)
+                )
+                if self.is_fsdp_enabled:
+                    self.model = model
+                if model is not self.model:
+                    self.model_wrapped = model
+                if self.is_deepspeed_enabled:
+                    self.deepspeed = self.model_wrapped
+
+            if not self.is_in_train:
+                if args.fp16_full_eval:
+                    model = model.to(dtype=torch.float16, device=args.device)
+                elif args.bf16_full_eval:
+                    model = model.to(dtype=torch.bfloat16, device=args.device)
+            model.eval()
+
+        with CodeBlock("预测循环"):
+            all_losses = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+            all_preds = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+            all_labels = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+            all_inputs = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+            batch_size = self.args.eval_batch_size
+            observed_num_examples = 0
+
+            for step, inputs in enumerate(dataloader):
+                ############### 单次预测 ###############
+                loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+
+                ############### 记录样本数量 ###############
+                observed_batch_size = find_batch_size(inputs)
+                if observed_batch_size is not None:
+                    observed_num_examples += observed_batch_size
+
+                with CodeBlock("记录单次预测结果"):
+                    main_input_name = getattr(self.model, "main_input_name", "input_ids")
+
+                    inputs_decode = self._prepare_input(inputs[main_input_name]) if args.include_inputs_for_metrics else None
+                    if inputs_decode is not None:
+                        inputs_decode = self.accelerator.pad_across_processes(inputs_decode, dim=1, pad_index=-100)
+                        inputs_decode = self.gather_function((inputs_decode))
+                        all_inputs.add(inputs_decode)
+
+                    if labels is not None:
+                        labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+                        labels = self.gather_function((labels))
+                        all_labels.add(labels)
+
+                    if loss is not None:
+                        losses = self.gather_function((loss.repeat(batch_size)))
+                        all_losses.add(losses)
+
+                    if logits is not None:
+                        logits = self.accelerator.pad_across_processes(logits, dim=1, pad_index=-100)
+                        if self.preprocess_logits_for_metrics is not None:
+                            logits = self.preprocess_logits_for_metrics(logits, labels)
+                        logits = self.gather_function((logits))
+                        all_preds.add(logits)
+
+        with CodeBlock("计算metrics"):
+            ############### 计算metrics（依赖传入的compute_metrics函数） ###############
+            all_losses = all_losses.get_arrays()
+            all_preds = all_preds.get_arrays()
+            all_labels = all_labels.get_arrays()
+            all_inputs = all_inputs.get_arrays()
+            if self.compute_metrics is not None and all_preds is not None and all_labels is not None:
+                if args.include_inputs_for_metrics:
+                    metrics = self.compute_metrics(
+                        EvalPrediction(predictions=all_preds, label_ids=all_labels, inputs=all_inputs)
+                    )
+                else:
+                    metrics = self.compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels))
+            else:
+                metrics = {}
+            metrics = denumpify_detensorize(metrics)
+
+            if isinstance(all_losses, list) and all_losses:
+                metrics[f"{metric_key_prefix}_loss"] = np.concatenate(all_losses).mean().item()
+            elif isinstance(all_losses, np.ndarray):
+                metrics[f"{metric_key_prefix}_loss"] = all_losses.mean().item()
+            if hasattr(self, "jit_compilation_time"):
+                metrics[f"{metric_key_prefix}_jit_compilation_time"] = self.jit_compilation_time
+
+            for key in list(metrics.keys()):
+                if not key.startswith(f"{metric_key_prefix}_"):
+                    metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
+
+        with CodeBlock("计算样本总数"):
+            eval_dataset = getattr(dataloader, "dataset", None)
+            if has_length(eval_dataset):
+                num_samples = len(eval_dataset)
+            elif isinstance(eval_dataset, IterableDatasetShard) and getattr(eval_dataset, "num_examples", 0) > 0:
+                num_samples = eval_dataset.num_examples
+            else:
+                if has_length(dataloader):
+                    num_samples = self.num_examples(dataloader)
+                else:
+                    num_samples = observed_num_examples
+            if num_samples == 0 and observed_num_examples > 0:
+                num_samples = observed_num_examples
+
+        return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples)
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+        if ignore_keys is None:
+            if hasattr(self.model, "config"):
+                ignore_keys = getattr(self.model.config, "keys_to_ignore_at_inference", [])
+            else:
+                ignore_keys = []
+
+        ############### 判断模型是否返回loss ###############
+        return_loss = inputs.get("return_loss", None)
+        if return_loss is None:
+            return_loss = can_return_loss(self.model.__class__)
+
+        has_labels = False if len(self.label_names) == 0 else all(inputs.get(k) is not None for k in self.label_names)
+        loss_without_labels = True if len(self.label_names) == 0 and return_loss else False
+        labels = None
+        if has_labels or loss_without_labels:
+            labels = nested_detach(tuple(inputs.get(name) for name in self.label_names))
+            if len(labels) == 1:
+                labels = labels[0]
+
+        ############### 调用模型 ###############
+        with torch.no_grad():
+            if has_labels or loss_without_labels:
+                loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                loss = loss.mean().detach()
+                if isinstance(outputs, dict):
+                    logits = tuple(v for k, v in outputs.items() if k not in ignore_keys + ["loss"])
+                else:
+                    logits = outputs[1:]
+            else:
+                loss = None
+                outputs = model(**inputs)
+                if isinstance(outputs, dict):
+                    logits = tuple(v for k, v in outputs.items() if k not in ignore_keys)
+                else:
+                    logits = outputs
+
+        ############### 返回结果 ###############
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        logits = nested_detach(logits)
+        if len(logits) == 1:
+            logits = logits[0]
+
+        return (loss, logits, labels)
+
     def __训练模型处理__(self):
         pass
 
@@ -547,6 +750,43 @@ class Trainer():
                 kwargs.update({"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()})
             return data.to(**kwargs)
         return data
+
+    def get_eval_dataloader(self, eval_dataset):
+        ############### eval_dataloader复用 ###############
+        if hasattr(self, "_eval_dataloader") and self.args.dataloader_persistent_workers:
+            return self.accelerator.prepare(self._eval_dataloader)
+
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        data_collator = self.data_collator
+
+        ############### 移除model.forward()不支持的参数 ###############
+        if is_datasets_available() and isinstance(eval_dataset, datasets.Dataset):
+            eval_dataset = self._remove_unused_columns(eval_dataset, description="evaluation")
+        else:
+            data_collator = self._get_collator_with_removed_columns(data_collator, description="evaluation")
+
+        ############### 构造dataloader ###############
+        dataloader_params = {
+            "batch_size": self.args.eval_batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+        }
+
+        if not isinstance(eval_dataset, torch.utils.data.IterableDataset):
+            dataloader_params["sampler"] = self._get_eval_sampler(eval_dataset)
+            dataloader_params["drop_last"] = self.args.dataloader_drop_last
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+
+        eval_dataloader = DataLoader(eval_dataset, **dataloader_params)
+        if self.args.dataloader_persistent_workers:
+            self._eval_dataloader = eval_dataloader
+
+        return self.accelerator.prepare(eval_dataloader)
+
+    def _get_eval_sampler(self, eval_dataset):
+        return SequentialSampler(eval_dataset)
 
     def __并行_分布式__(self):
         pass
