@@ -6,10 +6,11 @@
 # @Software: CleanTransformer
 # @Description: trainer
 
-import sys, math, inspect
+import os, re, sys, math, shutil, random, inspect, warnings
+from pathlib import Path
+from typing import Mapping
 from packaging import version
 from contextlib import contextmanager
-from typing import Mapping
 
 import torch
 import numpy as np
@@ -20,32 +21,55 @@ from torch.utils.data import (
     SequentialSampler,
 )
 
-import datasets
-from accelerate import Accelerator
+import datasets, transformers
+import safetensors.torch
 from transformers import (
     get_scheduler,
     PreTrainedModel,
+    PretrainedConfig,
     TrainingArguments,
     PreTrainedTokenizerBase,
     SequenceFeatureExtractor,
 )
 from accelerate.utils import (
+    load_fsdp_model,
     DistributedType,
+    save_fsdp_model,
+    save_fsdp_optimizer,
+    load_fsdp_optimizer,
     DataLoaderConfiguration,
+    DeepSpeedSchedulerWrapper,
     GradientAccumulationPlugin,
     DistributedDataParallelKwargs,
 )
 from transformers.utils import (
+    logging,
     find_labels,
     can_return_loss,
     is_datasets_available,
     is_accelerate_available,
 )
+from transformers.trainer import (
+    CONFIG_NAME,
+    WEIGHTS_NAME,
+    SCHEDULER_NAME,
+    OPTIMIZER_NAME,
+    FSDP_MODEL_NAME,
+    SAFE_WEIGHTS_NAME,
+    TRAINING_ARGS_NAME,
+    TRAINER_STATE_NAME,
+    WEIGHTS_INDEX_NAME,
+    OPTIMIZER_NAME_BIN,
+    SAFE_WEIGHTS_INDEX_NAME,
+)
 from transformers.integrations import (
     deepspeed_init,
+    deepspeed_load_checkpoint,
+    get_reporting_integration_callbacks,
 )
 from transformers.pytorch_utils import (
     ALL_LAYERNORM_LAYERS,
+    is_torch_greater_or_equal_than_1_13,
 )
 from transformers.trainer_utils import (
     has_length,
@@ -54,27 +78,48 @@ from transformers.trainer_utils import (
     EvalPrediction,
     EvalLoopOutput,
     number_of_arguments,
+    get_last_checkpoint,
     RemoveColumnsCollator,
     denumpify_detensorize,
+    PREFIX_CHECKPOINT_DIR,
 )
 from transformers.training_args import (
     ParallelMode,
 )
 from transformers.modeling_utils import (
     unwrap_model,
+    load_sharded_checkpoint,
 )
 from transformers.trainer_pt_utils import (
     nested_detach,
     find_batch_size,
     EvalLoopContainer,
+    distributed_concat,
+    reissue_pt_warnings,
     get_parameter_names,
     LengthGroupedSampler,
     IterableDatasetShard,
+    get_dataloader_sampler,
+    distributed_broadcast_scalars,
+)
+from transformers.trainer_callback import (
+    TrainerState,
+    TrainerControl,
+    PrinterCallback,
+    CallbackHandler,
+    ProgressCallback,
+    DefaultFlowCallback,
 )
 from transformers.data.data_collator import (
     default_data_collator,
     DataCollatorWithPadding,
 )
+from accelerate import Accelerator, skip_first_batches
+from accelerate import __version__ as accelerate_version
+
+if is_accelerate_available() and version.parse(accelerate_version) > version.parse('0.23.0'):
+    from accelerate.data_loader import SeedableRandomSampler
+logger = logging.get_logger(__name__)
 
 
 @contextmanager
@@ -94,6 +139,7 @@ class Trainer():
             model_init=None,
             compute_metrics=None,
             optimizers=(None, None),
+            callbacks=None,
             preprocess_logits_for_metrics=None,
     ):
         self.args = args
@@ -145,9 +191,6 @@ class Trainer():
         with CodeBlock('optimzier, scheduler处理'):
             self.optimizer, self.lr_scheduler = optimizers
 
-        with CodeBlock("state、control、callbacks初始化"):
-            pass  # todo: state, control, callbacks
-
         with CodeBlock("其他参数初始化"):
             ############### 判断model.forward()的输入参数 ###############
             self._signature_columns = None
@@ -165,6 +208,26 @@ class Trainer():
                 raise RuntimeError('使用deepspeed或fsdp时要求动态创建optimizer、scheduler，可以继承Trainer并修改create_optimizer、create_scheduler方法')
             if model_init is not None and (self.optimizer is not None or self.lr_scheduler is not None):
                 raise RuntimeError('使用model_init()时要求动态创建optimizer、scheduler，可以继承Trainer并修改create_optimizer、create_scheduler方法')
+
+        with CodeBlock("state、control、callbacks初始化"):
+            ############### TrainerState, TrainerControl初始化 ###############
+            self.state = TrainerState(
+                is_local_process_zero=self.is_local_process_zero(),
+                is_world_process_zero=self.is_world_process_zero(),
+            )
+            self.control = TrainerControl()
+
+            ############### callbacks初始化 ###############
+            # DefaultFlowCallback:
+            # 1. 根据设置的logging_strategy, evaluation_strategy, save_strategy等触发should_log, should_evaluate, should_save
+            # 2. 根据训练steps触发control.should_training_stop
+            default_callbacks = [DefaultFlowCallback] + get_reporting_integration_callbacks(self.args.report_to)
+            callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
+            self.callback_handler = CallbackHandler(callbacks, self.model, self.tokenizer, self.optimizer, self.lr_scheduler)
+            self.callback_handler.add_callback(PrinterCallback if self.args.disable_tqdm else ProgressCallback)
+
+            ############### 触发on_init_end回调 ###############
+            self.control = self.callback_handler.on_init_end(self.args, self.state, self.control)
 
     def __训练流程__(self):
         pass
@@ -261,17 +324,93 @@ class Trainer():
             if self.is_deepspeed_enabled:
                 self.deepspeed = self.model_wrapped
 
+        with CodeBlock("加载ckpt"):
+            if isinstance(resume_from_checkpoint, bool) and resume_from_checkpoint:
+                resume_from_checkpoint = get_last_checkpoint(args.output_dir)
+                if resume_from_checkpoint is None:
+                    raise ValueError(f"No valid checkpoint found in output directory ({args.output_dir})")
+            if resume_from_checkpoint is not None:
+                ############### 加载模型参数 ###############
+                if self.is_deepspeed_enabled or self.is_fsdp_enabled:
+                    self._load_from_checkpoint(resume_from_checkpoint, model=self.model_wrapped)
+                else:
+                    self._load_from_checkpoint(resume_from_checkpoint)
+
+                ############### 加载optimizer、scheduler参数 ###############
+                self._load_optimizer_and_scheduler(resume_from_checkpoint)
+
+        with CodeBlock("恢复训练进度"):
+            if resume_from_checkpoint is not None and os.path.isfile(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)):
+                self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+                assert self.state.train_batch_size == self._train_batch_size # 确保batch_size没有改变
+                # TODO: compare_trainer_and_checkpoint_args
+
+                ############### 恢复epoch ###############
+                epochs_trained = self.state.global_step // num_update_steps_per_epoch
+
+                ############### 恢复step ###############
+                if args.ignore_data_skip:
+                    steps_trained_in_current_epoch = 0
+                else:
+                    steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
+                    steps_trained_in_current_epoch *= args.gradient_accumulation_steps
+
+                logger.info("  Continuing training from checkpoint, will skip to saved global_step")
+                logger.info(f"  Continuing training from epoch {epochs_trained}")
+                logger.info(f"  Continuing training from global step {self.state.global_step}")
+                if not args.ignore_data_skip:
+                    ############### 模拟前epochs_trained次数据采样，以恢复sampler的rng_state ###############
+                    logger.info(f"  Will skip the first {epochs_trained} epochs")
+                    for epoch in range(epochs_trained):
+                        sampler = get_dataloader_sampler(train_dataloader)
+                        sampler_kinds = [RandomSampler]
+                        if version.parse(accelerate_version) > version.parse("0.23.0"):
+                            sampler_kinds.append(SeedableRandomSampler)
+                        is_random_sampler = isinstance(sampler, tuple(sampler_kinds))
+                        if not is_random_sampler:
+                            for _ in train_dataloader:  # TODO: 没明白非随机sampler为什么需要模拟数据采样
+                                break
+                        else:
+                            sampler = sampler if sampler is not None else []
+                            _ = list(sampler)
+
+        with CodeBlock('更新state, control, callbacks'):
+            def maybe_abs_or_ratio(abs_or_ratio, base_value, default):
+                if abs_or_ratio is None: return default
+                return base_value * abs_or_ratio if abs_or_ratio < 1 else abs_or_ratio
+
+            self.state.logging_steps = maybe_abs_or_ratio(args.logging_steps, max_steps, default=self.state.logging_steps)
+            self.state.eval_steps = maybe_abs_or_ratio(args.eval_steps, max_steps, default=self.state.eval_steps)
+            self.state.save_steps = maybe_abs_or_ratio(args.save_steps, max_steps, default=self.state.save_steps)
+            self.state.epoch = 0
+            self.state.max_steps = max_steps
+            self.state.num_train_epochs = num_train_epochs
+            self.state.train_batch_size = self._train_batch_size
+            self.state.is_local_process_zero = self.is_local_process_zero()
+            self.state.is_world_process_zero = self.is_world_process_zero()
+
+            self.callback_handler.model = self.model
+            self.callback_handler.optimizer = self.optimizer
+            self.callback_handler.lr_scheduler = self.lr_scheduler
+            self.callback_handler.train_dataloader = train_dataloader
+
+            # 训练开始
+            self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+
         with CodeBlock('训练循环'):
             with CodeBlock('变量初始化'):
                 tr_loss = torch.tensor(0.0).to(args.device)
                 self._total_loss_scalar = 0.0
                 self.current_flos = 0
-                epochs_trained = 0
-                global_step = 0
+                # epochs_trained = 0
                 total_batched_samples = 0
+                self._globalstep_last_logged = self.state.global_step
 
             ############### epoch循环 ###############
             for epoch in range(epochs_trained, num_train_epochs):
+                # 开始epoch训练
+                self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
+
                 epoch_iterator = train_dataloader
                 if hasattr(epoch_iterator, "set_epoch"):
                     epoch_iterator.set_epoch(epoch)
@@ -281,16 +420,37 @@ class Trainer():
                     if has_length(epoch_iterator)
                     else args.max_steps * args.gradient_accumulation_steps
                 )
+                ############### 恢复训练进度: 跳过steps_trained_in_current_epoch ###############
+                steps_skipped = 0
+                if epoch == epochs_trained and resume_from_checkpoint is not None:
+                    if steps_trained_in_current_epoch > 0:
+                        epoch_iterator = skip_first_batches(epoch_iterator, steps_trained_in_current_epoch)
+                        steps_skipped = steps_trained_in_current_epoch
+
+                    self._load_rng_state(resume_from_checkpoint)
 
                 ############### step循环 ###############
                 for step, inputs in enumerate(epoch_iterator):
                     ############### 单次forward、backward ###############
                     total_batched_samples += 1
+
+                    ############### 记录tokens数 ###############
+                    if self.args.include_num_input_tokens_seen:
+                        main_input_name = getattr(self.model, "main_input_name", "input_ids")
+                        if main_input_name in inputs:
+                            input_device = inputs[main_input_name].device
+                            self.state.num_input_tokens_seen += torch.sum(
+                                torch.tensor(inputs[main_input_name].numel(), device=input_device, dtype=torch.int64)
+                            ).item()
+                    if step % args.gradient_accumulation_steps == 0:
+                        # 开始step训练
+                        self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
+
                     model.zero_grad()
                     with self.accelerator.accumulate(model):
                         tr_loss_step = self.training_step(model, inputs)
                     tr_loss += tr_loss_step
-                    # global_step += 1
+                    self.current_flos += float(self.floating_point_ops(inputs))
 
                     ############### 模型参数更新 ###############
                     is_last_step_and_steps_less_than_grad_acc = (
@@ -320,10 +480,42 @@ class Trainer():
                                 if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                                     self.lr_scheduler.step()
 
-                        global_step += 1
+                        ############### state, control, callbacks ###############
+                        self.state.global_step += 1
+                        self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                        # 1个step训练结束
+                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-        train_loss = tr_loss.item() / max(global_step, 0.001)
-        return TrainOutput(global_step, train_loss, None)
+                        ############### evaluate ###############
+                        self._maybe_log_save_evaluate(tr_loss, grad_norm, model, epoch, ignore_keys_for_eval)
+                    else:
+                        # 梯度累计的1个substep训练结束
+                        self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+
+                    # 跳出step循环
+                    if self.control.should_epoch_stop or self.control.should_training_stop:
+                        break
+
+                ############### state, control, callbacks ###############
+                if step < 0:
+                    self.control.should_training_stop = True
+                # 1个epoch训练结束
+                self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
+
+                ############### evaluate ###############
+                self._maybe_log_save_evaluate(tr_loss, grad_norm, model, epoch, ignore_keys_for_eval)
+
+                # 跳出epoch循环
+                if self.control.should_training_stop:
+                    break
+
+        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+        train_loss = tr_loss.item() / max(self.state.global_step, 0.001)
+
+        if args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
+            self._load_best_model()
+
+        return TrainOutput(self.state.global_step, train_loss, None)
 
     def training_step(self, model, inputs):
         model.train()
@@ -377,11 +569,15 @@ class Trainer():
             metric_key_prefix=metric_key_prefix,
         )
 
+        # 完成evaluate
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, output.metrics)
+        self.log(output.metrics)
         return output.metrics
 
     def evaluation_loop(self, dataloader, description, prediction_loss_only=None, ignore_keys=None, metric_key_prefix='eval'):
         args = self.args
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
+        self.callback_handler.eval_dataloader = dataloader
 
         with CodeBlock("处理model"):
             # 处理逻辑和train()差不多，如果是在训练过程中进入evaluate()，model不会被重复处理
@@ -450,6 +646,9 @@ class Trainer():
                             logits = self.preprocess_logits_for_metrics(logits, labels)
                         logits = self.gather_function((logits))
                         all_preds.add(logits)
+
+                # 单步预测结束
+                self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
 
         with CodeBlock("计算metrics"):
             ############### 计算metrics（依赖传入的compute_metrics函数） ###############
@@ -915,6 +1114,462 @@ class Trainer():
             self.accelerator.ddp_handler = DistributedDataParallelKwargs(*kwargs)
 
         return model
+
+    def _nested_gather(self, tensors):
+        if tensors is None:
+            return
+        if (self.args.distributed_state is not None and self.args.distributed_state.distributed_type != "NO") or (
+                self.args.distributed_state is None and self.args.local_rank != -1
+        ):
+            tensors = distributed_concat(tensors)
+        return tensors
+
+    def __状态_日志__(self):
+        pass
+
+    def _maybe_log_save_evaluate(self, tr_loss, grad_norm, model, epoch, ignore_keys_for_eval):
+        ############### LOG ###############
+        if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
+            logs = {}
+
+            ############### 记录loss、lr、grad_norm ###############
+            # all_gather + mean() to get average loss over all processes
+            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+            logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            logs["learning_rate"] = self._get_learning_rate()
+            if grad_norm is not None:
+                logs["grad_norm"] = grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+
+            ############### 更新记录值 ###############
+            tr_loss -= tr_loss
+            self._total_loss_scalar += tr_loss_scalar
+            self._globalstep_last_logged = self.state.global_step
+            self.store_flos()
+
+            ############### 触发log相关Callbacks ###############
+            self.log(logs)
+
+        ############### EVALUATE ###############
+        metrics = None
+        if self.control.should_evaluate:
+            metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+            if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                metric_to_check = self.args.metric_for_best_model
+                if not metric_to_check.startswith("eval_"):
+                    metric_to_check = f"eval_{metric_to_check}"
+                self.lr_scheduler.step(metrics[metric_to_check])
+
+        ############### SAVE ###############
+        if self.control.should_save:
+            self._save_checkpoint(model, metrics=metrics)
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+
+    def floating_point_ops(self, inputs):
+        # 如果是PreTrainedModel, 可以调用model.floating_point_ops()获取forward+backward的浮点计算次数
+        # 如果不是PreTrainedModel，需要重写该方法
+        if hasattr(self.model, "floating_point_ops"):
+            return self.model.floating_point_ops(inputs)
+        else:
+            return 0
+
+    def store_flos(self):
+        if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+            self.state.total_flos += (
+                distributed_broadcast_scalars([self.current_flos], device=self.args.device).sum().item()
+            )
+            self.current_flos = 0
+        else:
+            self.state.total_flos += self.current_flos
+            self.current_flos = 0
+
+    def _get_learning_rate(self):
+        if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            last_lr = self.optimizer.param_groups[0]["lr"]
+        else:
+            last_lr = self.lr_scheduler.get_last_lr()[0]
+        if torch.is_tensor(last_lr):
+            last_lr = last_lr.item()
+        return last_lr
+
+    def log(self, logs):
+        ############### 设置epoch, step, tokens等 ###############
+        if self.state.epoch is not None:
+            logs['epoch'] = self.state.epoch
+        if self.args.include_num_input_tokens_seen:
+            logs["num_input_tokens_seen"] = self.state.num_input_tokens_seen
+        output = {**logs, **{"step": self.state.global_step}}
+
+        self.state.log_history.append(output)
+
+        ############### 触发log相关Callbacks ###############
+        self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
+
+    def __保存__(self):
+        pass
+
+    def _save_checkpoint(self, model, metrics=None):
+        ############### 获取保存路径 ###############
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        run_dir = self._get_output_dir()
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+
+        ############### 保存model ###############
+        self.save_model(output_dir)
+
+        ############### 保存optimizer、scheduler ###############
+        if not self.args.save_only_model:
+            self._save_optimizer_and_scheduler(output_dir)
+
+        ############### 保存trainer_state, rng_state ###############
+        if self.args.should_save:
+            self.store_flos()
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+            if not self.args.save_only_model:
+                self._save_rng_state(output_dir)
+
+        ############### 判断best_model ###############
+        if metrics is not None and self.args.metric_for_best_model is not None:
+            metric_to_check = self.args.metric_for_best_model
+            if not metric_to_check.startswith("eval_"):
+                metric_to_check = f"eval_{metric_to_check}"
+            metric_value = metrics[metric_to_check]
+
+            operator = np.greater if self.args.greater_is_better else np.less
+            if (
+                    self.state.best_metric is None
+                    or self.state.best_model_checkpoint is None
+                    or operator(metric_value, self.state.best_metric)
+            ):
+                self.state.best_metric = metric_value
+                self.state.best_model_checkpoint = output_dir
+
+        ############### 删除历史checkpoints（如果设置了save_total_limit） ###############
+        if self.args.should_save:
+            self._rotate_checkpoints(use_mtime=False, output_dir=run_dir)
+
+    def _get_output_dir(self):
+        return self.args.output_dir
+
+    def save_model(self, output_dir):
+        output_dir = output_dir or self.args.output_dir
+        state_dict = {}
+
+        if self.is_fsdp_enabled:
+            ############### 获取fsdp state_dict ###############
+            if ("FULL_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type)) and (
+                    version.parse(accelerate_version) > version.parse("0.24.1")
+            ):
+                from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+                full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+                    state_dict = self.model.state_dict()
+        elif self.is_deepspeed_enabled:
+            ############### 获取deepspeed state_dict ###############
+            try:
+                if self.accelerator.deepspeed_config["zero_optimization"]["stage"] == 3:
+                    if self.deepspeed.zero_gather_16bit_weights_on_model_save():
+                        state_dict = self.deepspeed._zero3_consolidated_16bit_state_dict()
+                    else:
+                        raise ValueError(
+                            "Cannot get 16bit model weights because `stage3_gather_16bit_weights_on_model_save` in DeepSpeed config is False. "
+                            "To save the model weights in 16bit, set `stage3_gather_16bit_weights_on_model_save` to True in DeepSpeed config file or "
+                            "set `zero3_save_16bit_model` to True when using `accelerate config`. "
+                            "To save the full checkpoint, run `model.save_checkpoint(save_dir)` and use `zero_to_fp32.py` to recover weights."
+                        )
+                else:
+                    from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
+
+                    state_dict = clone_tensors_for_torch_save(self.accelerator.unwrap_model(self.deepspeed).state_dict())
+            except ValueError:
+                ############### 直接保存成deepspeed格式(需要用zero_to_fp32.py进行格式转换) ###############
+                self.deepspeed.save_checkpoint(output_dir)
+
+        if self.args.should_save:
+            ############### 保存local checkpoint ###############
+            self._save(output_dir, state_dict=state_dict)
+
+    def _save(self, output_dir, state_dict=None):
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        ############### 保存state_dict ###############
+        supported_classes = (PreTrainedModel,)
+        if isinstance(self.model, supported_classes):
+            self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors)
+        elif isinstance(unwrap_model(self.model), supported_classes):
+            state_dict = state_dict or self.model.state_dict()
+            unwrap_model(self.model).save_pretrained(output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors)
+        else:
+            state_dict = state_dict or self.model.state_dict()
+            if self.args.save_safetensors:
+                safetensors.torch.save_file(state_dict, os.path.join(output_dir, SAFE_WEIGHTS_NAME), metadata={"format": "pt"})
+            else:
+                torch.save(state_dict, os.path.join(output_dir, WEIGHTS_NAME))
+
+        ############### 保存tokenizer (主要针对tokenizer) ###############
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(output_dir)
+
+        ############### 保存training_args (dict) ###############
+        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+
+    def _save_optimizer_and_scheduler(self, output_dir):
+        if self.is_deepspeed_enabled:
+            ############### deepspeed ###############
+            accept_exclude_frozen_parameters = "exclude_frozen_parameters" in set(
+                inspect.signature(self.model_wrapped.save_checkpoint).parameters.keys()
+            )
+            # 保存ds_model参数及optimizer
+            if accept_exclude_frozen_parameters:
+                self.model_wrapped.save_checkpoint(output_dir, exclude_frozen_parameters=True)
+            else:
+                self.model_wrapped.save_checkpoint(output_dir)
+        elif self.is_fsdp_enabled:
+            ############### fsdp ###############
+            # 保存fsdp_model参数
+            save_fsdp_model(
+                self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir
+            )
+            # 保存fsdp optimizer
+            save_fsdp_optimizer(
+                self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
+            )
+        elif self.args.should_save:
+            ############### local ###############
+            torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+
+        is_deepspeed_custom_scheduler = self.is_deepspeed_enabled and not isinstance(
+            self.lr_scheduler, DeepSpeedSchedulerWrapper
+        )
+        if (
+                self.args.should_save
+                and (not self.is_deepspeed_enabled or is_deepspeed_custom_scheduler)
+        ):
+            ############### scheduler ###############
+            torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+
+    def _save_rng_state(self, output_dir):
+        rng_states = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "cpu": torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+                rng_states["cuda"] = torch.cuda.random.get_rng_state_all()
+            else:
+                rng_states["cuda"] = torch.cuda.random.get_rng_state()
+
+        os.makedirs(output_dir, exist_ok=True)
+        if self.args.world_size <= 1:
+            torch.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+        else:
+            torch.save(rng_states, os.path.join(output_dir, f"rng_state_{self.args.process_index}.pth"))
+
+    def _rotate_checkpoints(self, use_mtime, output_dir):
+        if self.args.save_total_limit is None or self.args.save_total_limit <= 0:
+            return
+
+        checkpoints_sorted = self._sorted_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
+        if len(checkpoints_sorted) <= self.args.save_total_limit:
+            return
+
+        # If save_total_limit=1 with load_best_model_at_end=True, we could end up deleting the last checkpoint, which
+        # we don't do to allow resuming.
+        save_total_limit = self.args.save_total_limit
+        if (
+                self.state.best_model_checkpoint is not None
+                and self.args.save_total_limit == 1
+                and checkpoints_sorted[-1] != self.state.best_model_checkpoint
+        ):
+            save_total_limit = 2
+
+        number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - save_total_limit)
+        checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
+        for checkpoint in checkpoints_to_be_deleted:
+            shutil.rmtree(checkpoint, ignore_errors=True)
+
+    def _sorted_checkpoints(self, output_dir, checkpoint_prefix=PREFIX_CHECKPOINT_DIR, use_mtime=False):
+        ordering_and_checkpoint_path = []
+
+        glob_checkpoints = [str(x) for x in Path(output_dir).glob(f"{checkpoint_prefix}-*") if os.path.isdir(x)]
+
+        for path in glob_checkpoints:
+            if use_mtime:
+                ordering_and_checkpoint_path.append((os.path.getmtime(path), path))
+            else:
+                regex_match = re.match(f".*{checkpoint_prefix}-([0-9]+)", path)
+                if regex_match is not None and regex_match.groups() is not None:
+                    ordering_and_checkpoint_path.append((int(regex_match.groups()[0]), path))
+
+        checkpoints_sorted = sorted(ordering_and_checkpoint_path)
+        checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
+        # Make sure we don't delete the best model.
+        if (
+                self.state.best_model_checkpoint is not None
+                and str(Path(self.state.best_model_checkpoint)) in checkpoints_sorted
+        ):
+            best_model_index = checkpoints_sorted.index(str(Path(self.state.best_model_checkpoint)))
+            for i in range(best_model_index, len(checkpoints_sorted) - 2):
+                checkpoints_sorted[i], checkpoints_sorted[i + 1] = checkpoints_sorted[i + 1], checkpoints_sorted[i]
+        return checkpoints_sorted
+
+    def __加载__(self):
+        pass
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        model = model or self.model
+
+        ############### load config ###############
+        config_file = os.path.join(resume_from_checkpoint, CONFIG_NAME)
+        if os.path.isfile(config_file):
+            config = PretrainedConfig.from_json_file(config_file)
+            checkpoint_version = config.transformers_version
+            if checkpoint_version is not None and checkpoint_version != transformers.__version__:
+                logger.warning(
+                    f"checkpoint version: {checkpoint_version} 与当前transformers version: {transformers.__version__} 不一致，"
+                    "可能导致不兼容问题"
+                )
+
+        ############### load DeepSpeed checkpoint ###############
+        if self.is_deepspeed_enabled:
+            deepspeed_load_checkpoint(model, resume_from_checkpoint)
+            return
+
+        ############### load FSDP checkpoint ###############
+        is_fsdp_ckpt = os.path.isdir(resume_from_checkpoint) and (
+            # this checks the FSDP state dict when `SHARDED_STATE_DICT` is used
+                any(
+                    FSDP_MODEL_NAME in folder_name
+                    for folder_name in os.listdir(resume_from_checkpoint)
+                    if os.path.isdir(os.path.join(resume_from_checkpoint, folder_name))
+                )
+                # this checks the FSDP state dict when `FULL_STATE_DICT` is used
+                or os.path.isfile(os.path.join(resume_from_checkpoint, f"{FSDP_MODEL_NAME}.bin"))
+        )
+        if is_fsdp_ckpt:
+            assert self.is_fsdp_enabled, "FSDP checkpoint found but FSDP is not enabled"
+            load_fsdp_model(  # 会对FSDP的FULL_STATE_DICT、LOCAL_STATE_DICT、SHARDED_STATE_DICT三种模式分别处理
+                self.accelerator.state.fsdp_plugin,
+                self.accelerator,
+                model,
+                resume_from_checkpoint,
+            )
+            return
+
+        ############### load sharded checkpoint ###############
+        weights_index_file = os.path.join(resume_from_checkpoint, WEIGHTS_INDEX_NAME)
+        safe_weights_index_file = os.path.join(resume_from_checkpoint, SAFE_WEIGHTS_INDEX_NAME)
+        if os.path.exists(weights_index_file) or os.path.exists(safe_weights_index_file):
+            load_result = load_sharded_checkpoint(
+                model, resume_from_checkpoint, strict=False, prefer_safe=self.args.save_safetensors
+            )
+            self._issue_warnings_after_load(load_result)
+            return
+
+        ############### load local checkpoint ###############
+        weights_file = os.path.join(resume_from_checkpoint, WEIGHTS_NAME)
+        safe_weights_file = os.path.join(resume_from_checkpoint, SAFE_WEIGHTS_NAME)
+        if os.path.isfile(weights_file) or os.path.isfile(safe_weights_file):
+            weights_only_kwarg = {"weights_only": True} if is_torch_greater_or_equal_than_1_13 else {}
+            if self.args.save_safetensors and os.path.isfile(safe_weights_file):
+                state_dict = safetensors.torch.load_file(safe_weights_file, device="cpu")
+            else:
+                state_dict = torch.load(
+                    weights_file,
+                    map_location="cpu",
+                    **weights_only_kwarg,
+                )
+            load_result = model.load_state_dict(state_dict, False)
+            del state_dict
+
+            self._issue_warnings_after_load(load_result)
+            return
+
+    def _issue_warnings_after_load(self, load_result):
+        if len(load_result.missing_keys) != 0:
+            if self.model._keys_to_ignore_on_save is not None and set(load_result.missing_keys) == set(self.model._keys_to_ignore_on_save):
+                # 有丢失的weight，但属于_keys_to_ignore_on_save，默认当做共享weight，所以调用PreTrainedModel.tie_weights()对共享weight进行绑定
+                self.model.tie_weights()
+            else:
+                logger.warning(f"There were missing keys in the checkpoint model loaded: {load_result.missing_keys}.")
+        if len(load_result.unexpected_keys) != 0:
+            logger.warning(
+                f"There were unexpected keys in the checkpoint model loaded: {load_result.unexpected_keys}."
+            )
+
+    def _load_best_model(self):
+        logger.info(f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).")
+
+        if self.is_deepspeed_enabled or self.is_fsdp_enabled:
+            self._load_from_checkpoint(self.state.best_model_checkpoint, model=self.model_wrapped)
+        else:
+            self._load_from_checkpoint(self.state.best_model_checkpoint)
+
+    def _load_optimizer_and_scheduler(self, checkpoint):
+        if checkpoint is None: return
+
+        ############### deepspeed ###############
+        if self.is_deepspeed_enabled and isinstance(self.lr_scheduler, DeepSpeedSchedulerWrapper):
+            # deepspeed loads optimizer/lr_scheduler together with the model in deepspeed_init
+            return
+
+        ############### fsdp ###############
+        if self.is_fsdp_enabled:
+            load_fsdp_optimizer(
+                self.accelerator.state.fsdp_plugin,
+                self.accelerator,
+                self.optimizer,
+                self.model,
+                checkpoint,
+            )
+            return
+
+        ############### 本地optimizer、scheduler ###############
+        checkpoint_file_exists = (
+                os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME)) or os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME_BIN))
+                or (
+                        os.path.isdir(checkpoint)
+                        and any(OPTIMIZER_NAME_BIN.split(".")[0] in folder_name
+                                for folder_name in os.listdir(checkpoint)
+                                if os.path.isdir(os.path.join(checkpoint, folder_name))
+                                )
+                )
+        )
+        if checkpoint_file_exists and os.path.isfile(os.path.join(checkpoint, SCHEDULER_NAME)):
+            map_location = self.args.device if self.args.world_size > 1 else "cpu"
+            self.optimizer.load_state_dict(torch.load(os.path.join(checkpoint, OPTIMIZER_NAME), map_location=map_location))
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                self.lr_scheduler.load_state_dict(torch.load(os.path.join(checkpoint, SCHEDULER_NAME)))
+            reissue_pt_warnings(caught_warnings)
+
+    def _load_rng_state(self, checkpoint):
+        if checkpoint is None:
+            return
+
+        rng_file = os.path.join(checkpoint, "rng_state.pth")
+        if not os.path.isfile(rng_file):
+            return
+
+        checkpoint_rng_state = torch.load(rng_file)
+        random.setstate(checkpoint_rng_state["python"])
+        np.random.set_state(checkpoint_rng_state["numpy"])
+        torch.random.set_rng_state(checkpoint_rng_state["cpu"])
+
+        if torch.cuda.is_available():
+            torch.cuda.random.set_rng_state_all(checkpoint_rng_state["cuda"])
+
+    def __其他方法__(self):
+        pass
+
+    def is_local_process_zero(self):
+        return self.args.local_process_index == 0
+
+    def is_world_process_zero(self):
+        return self.args.process_index == 0
 
 
 if __name__ == "__main__":
