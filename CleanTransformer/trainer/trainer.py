@@ -60,7 +60,12 @@ from transformers.trainer import (
     TRAINER_STATE_NAME,
     WEIGHTS_INDEX_NAME,
     OPTIMIZER_NAME_BIN,
+    ADAPTER_WEIGHTS_NAME,
     SAFE_WEIGHTS_INDEX_NAME,
+
+    _is_peft_model,
+    is_peft_available,
+    _get_fsdp_ckpt_kwargs,
 )
 from transformers.integrations import (
     deepspeed_init,
@@ -82,6 +87,7 @@ from transformers.trainer_utils import (
     RemoveColumnsCollator,
     denumpify_detensorize,
     PREFIX_CHECKPOINT_DIR,
+    neftune_post_forward_hook,
 )
 from transformers.training_args import (
     ParallelMode,
@@ -92,6 +98,7 @@ from transformers.modeling_utils import (
 )
 from transformers.trainer_pt_utils import (
     nested_detach,
+    LabelSmoother,
     find_batch_size,
     EvalLoopContainer,
     distributed_concat,
@@ -114,8 +121,10 @@ from transformers.data.data_collator import (
     default_data_collator,
     DataCollatorWithPadding,
 )
+from peft import PeftModel
 from accelerate import Accelerator, skip_first_batches
 from accelerate import __version__ as accelerate_version
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 if is_accelerate_available() and version.parse(accelerate_version) > version.parse('0.23.0'):
     from accelerate.data_loader import SeedableRandomSampler
@@ -201,6 +210,15 @@ class Trainer():
             self.compute_metrics = compute_metrics
             self.preprocess_logits_for_metrics = preprocess_logits_for_metrics
 
+            ############### label smoothing ###############
+            if self.args.label_smoothing_factor != 0:
+                self.label_smoother = LabelSmoother(epsilon=self.args.label_smoothing_factor)
+            else:
+                self.label_smoother = None
+
+            ############### neftune ###############
+            self.neftune_noise_alpha = args.neftune_noise_alpha
+
             self.is_in_train = False
 
         with CodeBlock("参数异常校验"):
@@ -234,6 +252,8 @@ class Trainer():
 
     def train(self, ignore_keys_for_eval=None, resume_from_checkpoint=None, **kwargs):
         self.is_in_train = True
+        if self.neftune_noise_alpha is not None:
+            self.model = self._activate_neftune(self.model)
 
         with CodeBlock("训练循环"):
             train_output = self._inner_training_loop(
@@ -243,6 +263,8 @@ class Trainer():
                 resume_from_checkpoint=kwargs.pop('model_path', resume_from_checkpoint),
             )
 
+        if self.neftune_noise_alpha is not None:
+            self._deactivate_neftune(self.model)
         self.is_in_train = False
 
         return train_output
@@ -305,6 +327,7 @@ class Trainer():
             if delay_optimizer_creation:
                 ############### 先处理model，再创建optimizer、scheduler ###############
                 if use_accelerator_prepare:
+                    self._fsdp_qlora_plugin_updates()
                     self.model = self.accelerator.prepare_model(self.model)
                 self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
@@ -342,7 +365,7 @@ class Trainer():
         with CodeBlock("恢复训练进度"):
             if resume_from_checkpoint is not None and os.path.isfile(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)):
                 self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
-                assert self.state.train_batch_size == self._train_batch_size # 确保batch_size没有改变
+                assert self.state.train_batch_size == self._train_batch_size  # 确保batch_size没有改变
                 # TODO: compare_trainer_and_checkpoint_args
 
                 ############### 恢复epoch ###############
@@ -535,10 +558,31 @@ class Trainer():
     def compute_loss(self, model, inputs, return_outputs=False):
         # 这部分主要是针对hf-transformers的模型，如果是自定义模型，可以覆盖compute_loss()函数
         outputs = model(**inputs)
-        if isinstance(outputs, dict) and "loss" not in outputs:
-            raise ValueError('模型未返回loss')
-        # 默认outputs[0]为loss
-        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+
+        if labels is not None:
+            ############### label smoothing, 仅针对CrossEntropyLoss  ###############
+            unwrapped_model = unwrap_model(model)
+            model_name = unwrapped_model._get_name()
+            if _is_peft_model(unwrapped_model):
+                model_name = unwrapped_model.base_model.model._get_name()
+            else:
+                model_name = unwrapped_model._get_name()
+
+            if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError('模型未返回loss')
+            # 默认outputs[0]为loss
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
         return (loss, outputs) if return_outputs else loss
 
     def __评测流程__(self):
@@ -820,6 +864,48 @@ class Trainer():
             self._created_lr_scheduler = True
         return self.lr_scheduler
 
+    def _activate_neftune(self, model):
+        """
+        code: https://github.com/neelsjain/NEFTune
+        paper: https://arxiv.org/abs/2310.05914
+        """
+        # embeddings = unwrap_model(model).get_input_embeddings()
+        unwrapped_model = unwrap_model(model)
+        if _is_peft_model(unwrapped_model):
+            embeddings = unwrapped_model.base_model.model.get_input_embeddings()
+        else:
+            embeddings = unwrapped_model.get_input_embeddings()
+        del unwrapped_model
+        embeddings.neftune_noise_alpha = self.neftune_noise_alpha
+
+        ############### 每次forward时加入随机噪音 ###############
+        hook_handle = embeddings.register_forward_hook(neftune_post_forward_hook)
+        self.neftune_hook_handle = hook_handle
+        return model
+
+    def _deactivate_neftune(self, model):
+        if not hasattr(self, "neftune_hook_handle"):
+            raise ValueError("Neftune is not activated make sure to call `trainer._activate_neftune()` first")
+        self.neftune_hook_handle.remove()
+
+        # embeddings = unwrap_model(model).get_input_embeddings()
+        unwrapped_model = unwrap_model(model)
+        if _is_peft_model(unwrapped_model):
+            embeddings = unwrapped_model.base_model.model.get_input_embeddings()
+        else:
+            embeddings = unwrapped_model.get_input_embeddings()
+
+        del embeddings.neftune_noise_alpha, unwrapped_model
+
+    def _fsdp_qlora_plugin_updates(self):
+        if self.is_fsdp_enabled and _is_peft_model(self.model):
+            from peft import LoraConfig
+            from peft.utils.other import fsdp_auto_wrap_policy
+
+            if isinstance(self.model.active_peft_config, LoraConfig):
+                fsdp_plugin = self.accelerator.state.fsdp_plugin
+                fsdp_plugin.auto_wrap_policy = fsdp_auto_wrap_policy(self.model)
+
     def __数据处理__(self):
         pass
 
@@ -902,7 +988,14 @@ class Trainer():
     def _set_signature_columns_if_needed(self):
         '''获取model.forward()输入参数'''
         if self._signature_columns is None:
-            model_to_inspect = self.model
+            if _is_peft_model(self.model):
+                if hasattr(self.model, "get_base_model"):
+                    model_to_inspect = self.model.get_base_model()
+                else:
+                    model_to_inspect = self.model.base_model.model
+            else:
+                model_to_inspect = self.model
+
             signature = inspect.signature(model_to_inspect.forward)
             self._signature_columns = list(signature.parameters.keys())
             # 防止误删除label标签
@@ -1296,7 +1389,7 @@ class Trainer():
         os.makedirs(output_dir, exist_ok=True)
 
         ############### 保存state_dict ###############
-        supported_classes = (PreTrainedModel,)
+        supported_classes = (PreTrainedModel,) if not is_peft_available() else (PreTrainedModel, PeftModel)
         if isinstance(self.model, supported_classes):
             self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors)
         elif isinstance(unwrap_model(self.model), supported_classes):
@@ -1323,7 +1416,7 @@ class Trainer():
                 inspect.signature(self.model_wrapped.save_checkpoint).parameters.keys()
             )
             # 保存ds_model参数及optimizer
-            if accept_exclude_frozen_parameters:
+            if accept_exclude_frozen_parameters and _is_peft_model(self.model):
                 self.model_wrapped.save_checkpoint(output_dir, exclude_frozen_parameters=True)
             else:
                 self.model_wrapped.save_checkpoint(output_dir)
@@ -1331,7 +1424,7 @@ class Trainer():
             ############### fsdp ###############
             # 保存fsdp_model参数
             save_fsdp_model(
-                self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir
+                self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **_get_fsdp_ckpt_kwargs()
             )
             # 保存fsdp optimizer
             save_fsdp_optimizer(
@@ -1436,7 +1529,7 @@ class Trainer():
 
         ############### load DeepSpeed checkpoint ###############
         if self.is_deepspeed_enabled:
-            deepspeed_load_checkpoint(model, resume_from_checkpoint)
+            deepspeed_load_checkpoint(model, resume_from_checkpoint, load_module_strict=not _is_peft_model(self.model))
             return
 
         ############### load FSDP checkpoint ###############
@@ -1457,7 +1550,21 @@ class Trainer():
                 self.accelerator,
                 model,
                 resume_from_checkpoint,
+                **_get_fsdp_ckpt_kwargs()
             )
+            return
+
+        ############### load peft checkpoint ###############
+        if _is_peft_model(model):
+            if hasattr(model, "active_adapter") and hasattr(model, "load_adapter"):
+                if os.path.exists(resume_from_checkpoint):
+                    model.load_adapter(resume_from_checkpoint, model.active_adapter, is_trainable=True)
+                else:
+                    logger.warning(
+                        "未找到PEFT checkpoint文件：{ADAPTER_WEIGHTS_NAME}, 参考: https://github.com/huggingface/peft/issues/96"
+                    )
+            else:
+                logger.warning("Could not load adapter model, make sure to have `peft>=0.3.0` installed")
             return
 
         ############### load sharded checkpoint ###############
